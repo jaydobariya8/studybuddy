@@ -18,7 +18,9 @@ logging.getLogger("google_genai.models").setLevel(logging.ERROR)  # hide SDK cha
 
 load_dotenv()
 
-MODEL = "gemini-2.5-flash"
+# Free tier allows only a few requests per day PER MODEL, so we try these in order
+# and move to the next one if Gemini says "too many requests" (429).
+MODELS = ["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-3.5-flash"]
 
 # The system prompt: Role, Task, Context, Rules.
 # This is what turns a generic assistant into StudyBuddy.
@@ -66,12 +68,18 @@ def ask_gemini(client: genai.Client, history: list[dict[str, str]], quiz_mode: b
         types.Content(role=message["role"], parts=[types.Part(text=message["text"])])
         for message in history
     ]
-    response = client.models.generate_content(
-        model=MODEL,
-        contents=contents,
-        config=types.GenerateContentConfig(system_instruction=build_system_prompt(quiz_mode)),
-    )
-    return response.text or "I couldn't come up with an answer. Try asking another way."
+    config = types.GenerateContentConfig(system_instruction=build_system_prompt(quiz_mode))
+
+    for index, model in enumerate(MODELS):
+        try:
+            response = client.models.generate_content(model=model, contents=contents, config=config)
+        except errors.APIError as error:
+            is_last_model = index == len(MODELS) - 1
+            if error.code != 429 or is_last_model:
+                raise
+            continue  # this model's daily quota is used up - try the next one
+        return response.text or "I couldn't come up with an answer. Try asking another way."
+    raise RuntimeError("unreachable: every model either returned or raised")
 
 
 def friendly_error(error: errors.APIError) -> str:
@@ -79,7 +87,7 @@ def friendly_error(error: errors.APIError) -> str:
     if error.code in (400, 401, 403):
         return "Gemini rejected the API key. Check GEMINI_API_KEY in your .env file."
     if error.code == 429:
-        return "Too many requests - the free tier limit was hit. Wait a minute and try again."
+        return "Too many requests - today's free-tier limit is used up on every model. Try a key from a new project."
     return f"Gemini returned an error ({error.code}). Try again in a moment."
 
 
